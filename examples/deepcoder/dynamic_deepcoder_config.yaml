@@ -1,0 +1,113 @@
+# Example configuration for DeepCoder training with dynamic problem generation
+# This config shows how to enable GPT-4o-based problem generation for DeepCoder tasks
+
+trainer:
+  # Standard PPO trainer configuration
+  project_name: "deepcoder_dynamic"
+  experiment_name: "dynamic_generation_deepcoder"
+  logger: "wandb"  # or "tensorboard"
+  
+  # Training parameters
+  total_epochs: 100
+  critic_warmup: 0
+  test_freq: 10
+  save_freq: 10
+  val_before_train: true
+  
+  # Dynamic generation settings for DeepCoder
+  dynamic_generation_threshold: 50  # Switch to ChatGPT generation after this many steps
+  dynamic_generation_frequency: 20  # Generate new problems every N steps
+  problems_per_generation: 8  # Number of problems to generate each time (generated one at a time)
+  openai_api_key: "your-openai-api-key-here"  # Set your OpenAI API key here
+  
+  # Standard directories
+  default_local_dir: "./checkpoints"
+  default_hdfs_dir: null
+
+data:
+  # Standard data configuration
+  train_files: ["path/to/your/train.parquet"]
+  val_files: ["path/to/your/val.parquet"]
+  train_batch_size: 128
+  prompt_key: "prompt"
+  max_prompt_length: 2048
+  max_response_length: 16384
+  template_type: "base"  # or "qwen-instruct"
+  return_raw_chat: false
+
+algorithm:
+  # PPO algorithm settings
+  adv_estimator: "grpo"  # or "gae"
+  gamma: 1.0
+  lam: 1.0
+  kl_penalty: "kl"
+  
+  kl_ctrl:
+    type: "adaptive"  # or "fixed"
+    kl_coef: 0.001
+    target_kl: 0.01
+    horizon: 10000
+
+# Model configurations
+actor_rollout_ref:
+  hybrid_engine: true
+  model:
+    path: "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B"
+    use_remove_padding: true
+    enable_gradient_checkpointing: true
+  
+  actor:
+    optim:
+      lr: 1e-6
+    loss_agg_mode: "seq-mean-token-mean"
+    ppo_mini_batch_size: 64
+    ppo_micro_batch_size: 16
+    ppo_epochs: 1
+    use_dynamic_bsz: true
+    ppo_max_token_len_per_gpu: 20000
+    use_kl_loss: false
+    kl_loss_coef: 0
+    ulysses_sequence_parallel_size: 2
+    entropy_coeff: 0
+    grad_clip: 1.0
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.28
+    fsdp_config:
+      param_offload: false
+      optimizer_offload: false
+  
+  rollout:
+    tensor_model_parallel_size: 2
+    name: "vllm"
+    mode: "async"
+    chat_scheduler: "verl.schedulers.completions_scheduler.CompletionsScheduler"
+    enforce_eager: false
+    temperature: 0.6
+    top_p: 0.95
+    gpu_memory_utilization: 0.8
+    n: 8
+    val_kwargs:
+      n: 2
+      temperature: 0.6
+      top_p: 0.95
+  
+  ref:
+    fsdp_config:
+      param_offload: true
+    log_prob_micro_batch_size_per_gpu: 1
+  
+  rollout:
+    log_prob_micro_batch_size_per_gpu: 1
+
+# Agent configuration
+agent:
+  max_steps: 1
+  use_stepwise_advantage: false
+
+# Critic configuration (optional)
+critic:
+  enable: false
+
+# Reward model configuration (optional)
+reward_model:
+  enable: false
