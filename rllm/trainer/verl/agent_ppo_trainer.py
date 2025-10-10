@@ -8,12 +8,11 @@ from functools import reduce
 from pprint import pprint
 from queue import Queue
 from threading import Thread
-from typing import List, Dict, Any, Tuple
 
 import numpy as np
 import torch
 from omegaconf import OmegaConf
-from openai import OpenAI
+from typing import Any
 
 from rllm.engine.agent_execution_engine import AsyncAgentExecutionEngine
 from verl import DataProto
@@ -31,50 +30,6 @@ from verl.trainer.ppo.ray_trainer import (
     compute_timing_metrics,
     reduce_metrics,
 )
-
-# DeepCoder-specific base prompt for GPT-4o dynamic problem generation
-DEEPCODER_BASE_PROMPT = """
-Generate ONE competitive programming problem in the exact format shown below. The problem should be appropriate for the model's current ability level.
-
-**Problem Requirements:**
-- Competitive programming style (like CodeForces/LeetCode)
-- Solvable in Python
-- Include 3-5 test cases with input/output
-- Specify difficulty: Easy, Medium, or Hard
-- Include algorithm type/category
-
-**Output Format (exactly this structure):**
-
-<problem>
-[Write a clear, concise problem statement here. Include:
-- Problem description
-- Input format specification
-- Output format specification
-- Constraints
-- Examples with input/output]
-</problem>
-
-<tests>
-[
-  {"input": "first test input", "output": "expected output", "testtype": "stdin_stdout"},
-  {"input": "second test input", "output": "expected output", "testtype": "stdin_stdout"},
-  {"input": "third test input", "output": "expected output", "testtype": "stdin_stdout"}
-]
-</tests>
-
-<metadata>
-{
-  "difficulty": "Easy|Medium|Hard",
-  "type": "Algorithm category (e.g., Array, String, Graph, DP, etc.)",
-  "func_name": null
-}
-</metadata>
-
----
-
-Model's recent output (for context on current ability):
-
-"""
 
 
 class AgentPPOTrainer(RayPPOTrainer):
@@ -98,34 +53,59 @@ class AgentPPOTrainer(RayPPOTrainer):
         self.env_args = env_args or {}
         self.agent_args = agent_args or {}
 
-        # Dynamic generation configuration with type validation
-        self.dynamic_generation_threshold = int(self.config.trainer.get("dynamic_generation_threshold", 0))
-        self.dynamic_generation_frequency = int(self.config.trainer.get("dynamic_generation_frequency", 10))
-        self.problems_per_generation = int(self.config.trainer.get("problems_per_generation", 8))  # Reduced since we generate one at a time
-        self.use_dynamic_generation = self.dynamic_generation_threshold > 0
-        
-        # Initialize OpenAI client for dynamic problem generation
-        self.openai_client = None
-        if self.use_dynamic_generation:
-            api_key = self.config.trainer.get("openai_api_key")
-            if api_key:
-                try:
-                    self.openai_client = OpenAI(api_key=api_key)
-                    # Test API key with a simple call
-                    self._validate_openai_api_key()
-                    print(f"Dynamic generation enabled: threshold={self.dynamic_generation_threshold}, frequency={self.dynamic_generation_frequency}")
-                except Exception as e:
-                    print(f"Warning: Failed to initialize OpenAI client: {e}")
-                    self.openai_client = None
-                    self.use_dynamic_generation = False
-            else:
-                print("Warning: Dynamic generation enabled but no OpenAI API key provided")
-                self.use_dynamic_generation = False
-        
-        # Track dynamic generation state
-        self.dynamic_generation_active = False
-        self.last_generation_step = 0
-        self.generated_problems_count = 0
+        # Dynamic goal generation (math_tool) configuration
+        self.dynamic_goals_enabled: bool = bool(self.config.env.get("dynamic_goals", {}).get("enable", False))
+        self.dynamic_goals_threshold: int = int(self.config.env.get("dynamic_goals", {}).get("threshold", 0))
+        self.dynamic_goals_interval: int = int(self.config.env.get("dynamic_goals", {}).get("interval", 1))
+        self.dynamic_goals_model: str = str(self.config.env.get("dynamic_goals", {}).get("model", "gpt-4o"))
+        self.dynamic_goals_max_tokens: int = int(self.config.env.get("dynamic_goals", {}).get("max_goal_tokens", 1024))
+        self.dynamic_goals_temperature: float = float(self.config.env.get("dynamic_goals", {}).get("temperature", 0.7))
+        self.dynamic_goals_timeout_s: float = float(self.config.env.get("dynamic_goals", {}).get("timeout_s", 30))
+        self.dynamic_goals_batch_size_cap: int = int(self.config.env.get("dynamic_goals", {}).get("batch_cap", 256))
+        self.dynamic_goals_data_source: str = str(self.config.env.get("dynamic_goals", {}).get("data_source", "dynamic_math_gpt4o"))
+        # Control per-call payload to avoid long completions
+        self.dynamic_goals_per_call: int = int(self.config.env.get("dynamic_goals", {}).get("per_call_count", 8))
+        self.dynamic_goals_problem_char_limit: int = int(self.config.env.get("dynamic_goals", {}).get("problem_char_limit", 2000))
+        self.dynamic_goals_gt_char_limit: int = int(self.config.env.get("dynamic_goals", {}).get("ground_truth_char_limit", 64))
+        # Style steering
+        self.dynamic_goals_style: str = str(self.config.env.get("dynamic_goals", {}).get("style", "deepscaler_math"))
+        self.dynamic_goals_use_example: bool = bool(self.config.env.get("dynamic_goals", {}).get("use_example", True))
+
+        self._openai_client = None
+        if self.dynamic_goals_enabled:
+            # OpenAI client is optional; only initialize when needed
+            try:
+                from openai import OpenAI
+
+                rollout_args = getattr(self.config.agent, "engine_args", {}) if hasattr(self.config, "agent") else {}
+                api_key = rollout_args.get("api_key", os.environ.get("OPENAI_API_KEY"))
+                base_url = rollout_args.get("base_url", None)
+
+                # Prefer explicit api_key on dynamic goals block if present
+                goals_api_key = self.config.env.get("dynamic_goals", {}).get("openai_api_key", None)
+                if goals_api_key is not None:
+                    api_key = goals_api_key
+
+                client_kwargs: dict[str, Any] = {}
+                if api_key is not None:
+                    client_kwargs["api_key"] = api_key
+                if base_url is not None:
+                    client_kwargs["base_url"] = base_url
+
+                self._openai_client = OpenAI(**client_kwargs)
+                print("[AgentPPOTrainer] Dynamic goals enabled; OpenAI client initialized")
+            except Exception as e:
+                print(f"[AgentPPOTrainer] Warning: failed to init OpenAI client for dynamic goals: {e}")
+                self._openai_client = None
+
+        # Rolling performance tracking for adaptive difficulty
+        self._rolling_pass_window: int = int(self.config.env.get("dynamic_goals", {}).get("rolling_window", 512))
+        self._target_pass_low: float = float(self.config.env.get("dynamic_goals", {}).get("target_pass_low", 0.35))
+        self._target_pass_high: float = float(self.config.env.get("dynamic_goals", {}).get("target_pass_high", 0.65))
+        self._recent_outcomes: list[bool] = []  # True if passed
+        # Tiny exemplar buffers: (problem:str, answer:str, passed:bool)
+        self._recent_solved: list[tuple[str, str]] = []
+        self._recent_failed: list[tuple[str, str]] = []
 
         if self.config.agent.use_stepwise_advantage:
             print("Using step-level advantage, max_prompt_length and max_response_length will be applied step-wise")
@@ -235,29 +215,9 @@ class AgentPPOTrainer(RayPPOTrainer):
 
         for epoch in range(self.config.trainer.total_epochs):
             pprint(f"epoch {epoch}, step {self.global_steps} started")
-            
-            # Check if we should switch to dynamic generation
-            if (self.use_dynamic_generation and 
-                not self.dynamic_generation_active and 
-                self.global_steps >= self.dynamic_generation_threshold):
-                print(f"Switching to dynamic generation at step {self.global_steps}")
-                self.dynamic_generation_active = True
-                self.last_generation_step = self.global_steps
-            
-            # Check if we should generate new problems
-            if (self.dynamic_generation_active and 
-                self.global_steps - self.last_generation_step >= self.dynamic_generation_frequency):
-                print(f"Generating new problems at step {self.global_steps}")
-                self._generate_and_update_dataloader()
-                self.last_generation_step = self.global_steps
-            
             for batch_dict in self.train_dataloader:
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
                 batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
-                
-                # Store batch for potential dynamic generation
-                if self.use_dynamic_generation:
-                    self.last_batch = batch
                 batch = batch.repeat(
                     repeat_times=self.config.actor_rollout_ref.rollout.n,
                     interleave=True,
@@ -272,6 +232,32 @@ class AgentPPOTrainer(RayPPOTrainer):
                 }
 
                 with _timer("step", timing_raw):
+                    # Optionally replace per-sample extra_info with dynamically generated math goals
+                    if self.dynamic_goals_enabled and self._should_refresh_dynamic_goals():
+                        try:
+                            batch_size = batch.batch["attention_mask"].shape[0] if "attention_mask" in batch.batch else len(batch.batch)
+                            # Respect cap to avoid excessive API usage
+                            n_goals = min(int(batch_size), self.dynamic_goals_batch_size_cap)
+                            goals = self._generate_math_goals(n_goals=n_goals)
+                            if goals and len(goals) == n_goals:
+                                # Fill or repeat to match exact batch size
+                                if n_goals < batch_size:
+                                    # Repeat goals to cover full batch
+                                    reps = (batch_size + n_goals - 1) // n_goals
+                                    goals = (goals * reps)[:batch_size]
+                                elif n_goals > batch_size:
+                                    goals = goals[:batch_size]
+
+                                # Attach as extra_info
+                                batch.non_tensor_batch["extra_info"] = np.array(goals, dtype=object)
+                                batch.non_tensor_batch["data_source"] = np.array([self.dynamic_goals_data_source] * batch_size, dtype=object)
+                                print(f"[AgentPPOTrainer] Injected {batch_size} dynamic math goals")
+                            else:
+                                print(f"[AgentPPOTrainer] Dynamic goals generation failed (got {len(goals) if goals else 0} goals, needed {n_goals}). Using original dataset.")
+                                # Don't modify the batch - keep using original dataset problems
+                        except Exception as e:
+                            print(f"[AgentPPOTrainer] Dynamic goals generation failed: {e}")
+
                     self.init_envs_and_agents(batch)
 
                     if self.config.agent.use_stepwise_advantage:
@@ -306,6 +292,67 @@ class AgentPPOTrainer(RayPPOTrainer):
                             batch.batch["token_level_scores"] = reward_tensor
                         else:
                             reward_tensor = batch.batch["token_level_scores"]  # filled in by environment collected trajectory transformation
+
+                        # Update rolling pass/fail stats for adaptive difficulty
+                        try:
+                            # Pass if summed reward >= 1 (aligned with math pass criteria)
+                            uid_to_pass: dict[str, bool] = {}
+                            uids = batch.non_tensor_batch["uid"]
+                            uid_rewards = reward_tensor.sum(-1).cpu().tolist()
+                            # Because of repeat, group by uid and take max
+                            for i, uid in enumerate(uids):
+                                passed = uid_rewards[i] >= 1.0
+                                if uid not in uid_to_pass:
+                                    uid_to_pass[uid] = passed
+                                else:
+                                    uid_to_pass[uid] = uid_to_pass[uid] or passed
+
+                            # Clip rolling window
+                            for passed in uid_to_pass.values():
+                                self._recent_outcomes.append(bool(passed))
+                            if len(self._recent_outcomes) > self._rolling_pass_window:
+                                excess = len(self._recent_outcomes) - self._rolling_pass_window
+                                self._recent_outcomes = self._recent_outcomes[excess:]
+
+                            # Collect tiny exemplars when available
+                            if "raw_prompt" in batch.non_tensor_batch:
+                                prompts = batch.non_tensor_batch["raw_prompt"]
+                                # Extract final model responses
+                                responses = batch.batch["responses"]
+                                decoded_responses = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in responses]
+                                # Take one example per unique uid
+                                seen_uids = set()
+                                for i, uid in enumerate(uids):
+                                    if uid in seen_uids:
+                                        continue
+                                    seen_uids.add(uid)
+                                    problem = None
+                                    # raw_prompt may be list[dict] chat; pick user content if present
+                                    try:
+                                        msg = prompts[i]
+                                        if isinstance(msg, list) and msg:
+                                            # find first user
+                                            user_msgs = [m for m in msg if isinstance(m, dict) and m.get("role") == "user"]
+                                            if user_msgs:
+                                                problem = user_msgs[0].get("content")
+                                        elif isinstance(msg, str):
+                                            problem = msg
+                                    except Exception:
+                                        problem = None
+                                    answer = decoded_responses[i] if i < len(decoded_responses) else None
+                                    if problem and answer:
+                                        # Keep short answers only for the tiny exemplar
+                                        short_answer = answer.split("\n")[-1][: self.dynamic_goals_gt_char_limit]
+                                        if uid_to_pass.get(uid, False):
+                                            self._recent_solved.append((problem[: self.dynamic_goals_problem_char_limit], short_answer))
+                                            if len(self._recent_solved) > 8:
+                                                self._recent_solved = self._recent_solved[-8:]
+                                        else:
+                                            self._recent_failed.append((problem[: self.dynamic_goals_problem_char_limit], short_answer))
+                                            if len(self._recent_failed) > 8:
+                                                self._recent_failed = self._recent_failed[-8:]
+                        except Exception as e:
+                            print(f"[AgentPPOTrainer] Rolling stats update failed: {e}")
 
                         # Rejection sampling based on rewards
                         # Group rewards by uid
@@ -991,6 +1038,166 @@ class AgentPPOTrainer(RayPPOTrainer):
                 self.visualize_trajectory(result, sample_idx=idx, max_samples=1)
         return result
 
+    def _should_refresh_dynamic_goals(self) -> bool:
+        """Return True if we should generate/refresh dynamic goals this step."""
+        if not self.dynamic_goals_enabled:
+            return False
+        if getattr(self, "global_steps", 0) < self.dynamic_goals_threshold:
+            return False
+        if self.dynamic_goals_interval <= 0:
+            return True
+        return (self.global_steps % self.dynamic_goals_interval) == 0
+
+    def _generate_math_goals(self, n_goals: int) -> list[dict[str, Any]]:
+        """Call GPT-4o repeatedly to produce compact math problems with ground truths.
+
+        Uses multiple small requests to control completion size and token usage.
+        """
+        if self._openai_client is None or n_goals <= 0:
+            return []
+
+        remaining = n_goals
+        collected: list[dict[str, Any]] = []
+        seen_problems: set[str] = set()
+
+        # Prepare static prompt pieces
+        system = "You are a precise data generator. Output strictly valid JSON only. No extra text."
+
+        # Determine difficulty direction from recent pass rate
+        pass_rate = None
+        if self._recent_outcomes:
+            pass_rate = sum(1 for x in self._recent_outcomes if x) / len(self._recent_outcomes)
+
+        difficulty_hint = ""
+        if pass_rate is not None:
+            if pass_rate > self._target_pass_high:
+                difficulty_hint = "Please make them slightly harder than the recent set."
+            elif pass_rate < self._target_pass_low:
+                difficulty_hint = "Please make them slightly easier than the recent set."
+            else:
+                difficulty_hint = "Keep similar difficulty to the recent set."
+
+        # Summarize 1-2 tiny exemplars (solved and failed) to calibrate difficulty
+        exemplar_lines = []
+        if self.dynamic_goals_use_example:
+            try:
+                if self._recent_solved:
+                    p, a = self._recent_solved[-1]
+                    exemplar_lines.append(f'Solved exemplar: problem="{p}", answer="{a}"')
+                if self._recent_failed:
+                    p, a = self._recent_failed[-1]
+                    exemplar_lines.append(f'Failed exemplar: problem="{p}", answer="{a}"')
+            except Exception:
+                exemplar_lines = []
+
+        while remaining > 0:
+            per_call = max(1, min(self.dynamic_goals_per_call, remaining))
+            # Style steering (Deepscaler/AIME-like)
+            style_lines = []
+            if self.dynamic_goals_style.lower() in ["deepscaler_math", "aime", "contest_math", "math_tool"]:
+                style_lines.extend([
+                    "Style: contest-style problems similar to Deepscaler/AIME (algebra, number theory, combinatorics, geometry).",
+                    "Constraints: self-contained; no external diagrams; single-part question; medium-hard difficulty; no open-ended answers.",
+                    "Answer format: final numeric (integer/rational/decimal) or very short expression only.",
+                ])
+            example_line = ""
+            if self.dynamic_goals_use_example:
+                # Tiny exemplar to steer without many tokens
+                example_line = (
+                    "Example item format: {\"problem\": \"If 3x+5=20, find x.\", \"ground_truth\": \"5\"}.\n"
+                )
+
+            # Keep the instruction minimal and enforce char limits to avoid verbose problems
+            user = (
+                ("\n".join(style_lines) + ("\n" if style_lines else ""))
+                + ("\n".join(exemplar_lines) + ("\n" if exemplar_lines else ""))
+                + (difficulty_hint + ("\n" if difficulty_hint else ""))
+                + example_line
+                + f"Return exactly {per_call} items as a JSON array. Each item is an object with keys 'problem' and 'ground_truth'.\n"
+                + f"- 'problem': a single self-contained math question string (<= {self.dynamic_goals_problem_char_limit} chars).\n"
+                + f"- 'ground_truth': the exact final numeric or short-form answer (string or array of strings, each <= {self.dynamic_goals_gt_char_limit} chars).\n"
+                + "No reasoning, no explanations, no derivations. No markdown. Do not escape or pretty-print."
+            )
+
+            try:
+                resp = self._openai_client.chat.completions.create(
+                    model=self.dynamic_goals_model,
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                    temperature=self.dynamic_goals_temperature,
+                    max_tokens=self.dynamic_goals_max_tokens,
+                )
+                content = resp.choices[0].message.content.strip()
+            except Exception as e:
+                print(f"[AgentPPOTrainer] OpenAI call failed: {e}")
+                print(f"[AgentPPOTrainer] Request details: model={self.dynamic_goals_model}, per_call={per_call}, remaining={remaining}")
+                break
+
+            # Parse and sanitize
+            try:
+                goals = json.loads(content)
+                if not isinstance(goals, list):
+                    goals = []
+            except Exception as e:
+                print(f"[AgentPPOTrainer] Failed to parse GPT output as JSON: {e}")
+                print(f"[AgentPPOTrainer] Raw GPT output: {content[:200]}...")
+                goals = []
+
+            added = 0
+            for g in goals:
+                if not isinstance(g, dict):
+                    continue
+                problem = g.get("problem")
+                gt = g.get("ground_truth")
+                if not isinstance(problem, str):
+                    continue
+                problem = problem.strip()
+                if len(problem) == 0 or len(problem) > self.dynamic_goals_problem_char_limit:
+                    continue
+                if problem in seen_problems:
+                    continue
+                # Normalize ground truth to list[str] with char limits
+                ground_truth: list[str]
+                if isinstance(gt, (int, float)):
+                    gt = str(gt)
+                if isinstance(gt, str):
+                    if len(gt) == 0 or len(gt) > self.dynamic_goals_gt_char_limit:
+                        continue
+                    ground_truth = [gt]
+                elif isinstance(gt, list):
+                    norm = []
+                    for x in gt:
+                        if isinstance(x, (str, int, float)):
+                            sx = str(x)
+                            if 0 < len(sx) <= self.dynamic_goals_gt_char_limit:
+                                norm.append(sx)
+                    if not norm:
+                        continue
+                    ground_truth = norm
+                else:
+                    continue
+
+                collected.append({
+                    "problem": problem,
+                    "ground_truth": ground_truth,
+                    "data_source": self.dynamic_goals_data_source,
+                })
+                seen_problems.add(problem)
+                added += 1
+                if added >= per_call:
+                    break
+
+            remaining = max(0, n_goals - len(collected))
+            # If the model under-delivered, continue loop to request more until we meet n_goals
+
+            # Safety: avoid infinite loops if nothing is added
+            if added == 0:
+                break
+
+        return collected[:n_goals]
+
     def _stepwise_advantage_broadcast(self, last_step_batch, other_step_batch):
         """
         Broadcast the advantage from last_step_batch to all other steps.
@@ -1064,451 +1271,3 @@ class AgentPPOTrainer(RayPPOTrainer):
             batch.non_tensor_batch["is_pad_step"][idx] = True
 
         return batch
-
-    def _extract_sample_output(self, batch: DataProto) -> str:
-        """Extract a sample output from the batch for use in ChatGPT prompt."""
-        try:
-            # Get the first example from the batch
-            response_batch = batch.batch['responses'][0]  # First response
-            
-            # Decode just the response part
-            sample_text = self.tokenizer.decode(response_batch, skip_special_tokens=True)
-            
-            # Extract the part after "Assistant:" if present
-            if "Assistant:" in sample_text:
-                sample_text = "Assistant:" + sample_text.split("Assistant:", 1)[1]
-            
-            # Truncate if too long to avoid token limits
-            if len(sample_text) > 2000:
-                sample_text = sample_text[:1000] + "\n...(truncated)...\n" + sample_text[-1000:]
-            
-            return sample_text.strip()
-        except Exception as e:
-            print(f"Error extracting sample output: {e}")
-            return "No sample available"
-
-    def _generate_new_problems_with_chatgpt(self, sample_output: str) -> List[Dict[str, Any]]:
-        """Generate new DeepCoder problems using ChatGPT based on the sample output."""
-        try:
-            if self.openai_client is None:
-                print("OpenAI client not initialized. Cannot generate new problems.")
-                return []
-            
-            print(f"Generating {self.problems_per_generation} problems one at a time...")
-            all_problems = []
-            successful_generations = 0
-            failed_generations = 0
-            
-            for i in range(self.problems_per_generation):
-                retry_count = 0
-                problem_generated = False
-                
-                while retry_count < 3 and not problem_generated:
-                    try:
-                        # Construct the full prompt for single problem generation
-                        full_prompt = DEEPCODER_BASE_PROMPT + "\n" + sample_output
-                        
-                        response = self.openai_client.chat.completions.create(
-                            model="gpt-4o",
-                            messages=[
-                                {"role": "system", "content": "You are a helpful assistant that generates competitive programming problems."},
-                                {"role": "user", "content": full_prompt}
-                            ],
-                            max_completion_tokens=8000,
-                            temperature=0.7
-                        )
-                        
-                        gpt4_output = response.choices[0].message.content
-                        
-                        # Extract single problem from the GPT-4 output
-                        problem = self._extract_single_problem_from_gpt4_output(gpt4_output)
-                        
-                        if problem:
-                            all_problems.append(problem)
-                            successful_generations += 1
-                            problem_generated = True
-                            print(f"Generated problem {i+1}/{self.problems_per_generation}")
-                        else:
-                            retry_count += 1
-                            print(f"Failed to generate problem {i+1}, retry {retry_count}/3")
-                        
-                    except Exception as e:
-                        if "rate_limit" in str(e).lower() or "429" in str(e):
-                            if self._handle_api_rate_limit(retry_count):
-                                retry_count += 1
-                                continue
-                            else:
-                                retry_count += 1  # Ensure retry_count is incremented
-                                break
-                        else:
-                            retry_count += 1
-                            print(f"Error generating problem {i+1}, retry {retry_count}/3: {e}")
-                
-                if not problem_generated:
-                    failed_generations += 1
-                    print(f"Failed to generate problem {i+1} after all retries")
-                
-                # Small delay to avoid rate limiting
-                import time
-                time.sleep(1.0)  # Increased delay for better rate limiting
-            
-            print(f"Generation complete: {successful_generations} successful, {failed_generations} failed")
-            
-            # Validate all problems
-            valid_problems = self._validate_generated_problems(all_problems)
-            
-            # If we don't have enough valid problems, try to fallback
-            if len(valid_problems) < self.problems_per_generation // 2:
-                print(f"Warning: Only {len(valid_problems)} valid problems generated, expected at least {self.problems_per_generation // 2}")
-                if len(valid_problems) == 0:
-                    self._fallback_to_original_dataloader()
-            
-            return valid_problems
-            
-        except Exception as e:
-            print(f"Error in problem generation pipeline: {e}")
-            return []
-
-    def _extract_single_problem_from_gpt4_output(self, gpt4_output: str) -> Dict[str, Any]:
-        """Extract a single problem from GPT-4 output and convert to DeepCoder format."""
-        try:
-            # Extract problem statement
-            if "<problem>" not in gpt4_output or "</problem>" not in gpt4_output:
-                print("No problem section found in GPT-4 output")
-                return None
-            
-            problem_text = gpt4_output.split("<problem>")[1].split("</problem>")[0].strip()
-            
-            # Extract tests
-            if "<tests>" not in gpt4_output or "</tests>" not in gpt4_output:
-                print("No tests section found in GPT-4 output")
-                return None
-            
-            tests_section = gpt4_output.split("<tests>")[1].split("</tests>")[0].strip()
-            try:
-                tests = json.loads(tests_section)
-            except json.JSONDecodeError as e:
-                print(f"Failed to parse tests JSON: {e}")
-                return None
-            
-            # Extract metadata
-            if "<metadata>" not in gpt4_output or "</metadata>" not in gpt4_output:
-                print("No metadata section found in GPT-4 output")
-                return None
-            
-            metadata_section = gpt4_output.split("<metadata>")[1].split("</metadata>")[0].strip()
-            try:
-                metadata = json.loads(metadata_section)
-            except json.JSONDecodeError as e:
-                print(f"Failed to parse metadata JSON: {e}")
-                return None
-            
-            # Ensure tests are in the correct format
-            for test in tests:
-                if "testtype" not in test:
-                    test["testtype"] = "stdin_stdout"
-                if "metadata" not in test:
-                    test["metadata"] = {"func_name": None}
-            
-            # Format the problem with LiveCodeBench system prompt
-            try:
-                from rllm.data.utils import fetch_live_code_bench_system_prompt
-                formatted_question = fetch_live_code_bench_system_prompt(problem_text, None)
-            except ImportError:
-                print("Warning: Could not import fetch_live_code_bench_system_prompt, using raw problem text")
-                formatted_question = problem_text
-            
-            deepcoder_problem = {
-                "question": formatted_question,
-                "ground_truth": json.dumps(tests),
-                "data_source": "dynamic_generated",
-                "uid": f"dynamic_{self.generated_problems_count}",
-                "index": self.generated_problems_count,
-                "starter_code": "",
-                "metadata": json.dumps({
-                    "difficulty": metadata.get("difficulty", "Medium"),
-                    "type": metadata.get("type", "Algorithm"),
-                    "generated_by": "gpt4o",
-                    "generation_step": self.global_steps
-                })
-            }
-            
-            self.generated_problems_count += 1
-            return deepcoder_problem
-            
-        except Exception as e:
-            print(f"Error extracting single problem from GPT-4 output: {e}")
-            return None
-
-    def _extract_problems_from_gpt4_output(self, gpt4_output: str) -> List[Dict[str, Any]]:
-        """Legacy method for extracting multiple problems (kept for compatibility)."""
-        # This method is now deprecated in favor of single problem generation
-        single_problem = self._extract_single_problem_from_gpt4_output(gpt4_output)
-        return [single_problem] if single_problem else []
-
-    def _create_dynamic_dataloader(self, problems: List[Dict[str, Any]]):
-        """Create a new dataloader from ChatGPT generated problems."""
-        try:
-            if not problems:
-                print("No problems provided for dynamic dataloader")
-                return None
-            
-            # Convert problems to the format expected by the dataloader
-            from datasets import Dataset
-            from rllm.data.dataset import DatasetRegistry
-            
-            # Create dataset from problems
-            dataset = Dataset.from_list(problems)
-            
-            # Register as a temporary dataset
-            dataset_name = f"dynamic_deepcoder_{self.global_steps}"
-            DatasetRegistry.register_dataset(dataset_name, dataset, "train")
-            
-            # Create new dataloader
-            from verl.data import DataLoader
-            from verl.data.data_utils import get_data_collator
-            
-            data_collator = get_data_collator(
-                tokenizer=self.tokenizer,
-                max_prompt_length=self.config.data.max_prompt_length,
-                max_response_length=self.config.data.max_response_length,
-                template_type=self.config.data.get("template_type", "base"),
-                return_raw_chat=self.config.data.get("return_raw_chat", False),
-            )
-            
-            new_dataloader = DataLoader(
-                dataset=dataset,
-                batch_size=self.config.data.train_batch_size,
-                shuffle=True,
-                collate_fn=data_collator,
-                num_workers=0,
-            )
-            
-            print(f"Created dynamic dataloader with {len(problems)} problems")
-            return new_dataloader
-            
-        except Exception as e:
-            print(f"Error creating dynamic dataloader: {e}")
-            return None
-
-    def _generate_and_update_dataloader(self):
-        """Generate new problems and update the training dataloader."""
-        try:
-            # Extract a sample from the current batch if available
-            sample_output = "No sample available"
-            if hasattr(self, 'last_batch') and self.last_batch is not None:
-                sample_output = self._extract_sample_output(self.last_batch)
-            
-            # Generate new problems
-            new_problems = self._generate_new_problems_with_chatgpt(sample_output)
-            
-            if new_problems:
-                # Log detailed statistics
-                self._log_generation_stats(new_problems)
-                
-                # Save problems for analysis
-                self._save_generated_problems(new_problems, self.global_steps)
-                
-                # Create new dataloader
-                new_dataloader = self._create_dynamic_dataloader(new_problems)
-                
-                if new_dataloader is not None:
-                    # Update the training dataloader
-                    self.train_dataloader = new_dataloader
-                    print(f"Updated training dataloader with {len(new_problems)} new problems")
-                    
-                    # Log comprehensive metrics
-                    metrics = {
-                        "dynamic_generation/problems_generated": len(new_problems),
-                        "dynamic_generation/total_generated": self.generated_problems_count,
-                        "dynamic_generation/generation_step": self.global_steps,
-                        "dynamic_generation/active": self.dynamic_generation_active,
-                        "dynamic_generation/dataloader_size": len(new_dataloader.dataset) if hasattr(new_dataloader, 'dataset') else 0
-                    }
-                    
-                    # Add problem difficulty distribution
-                    difficulty_counts = {}
-                    problem_types = {}
-                    for problem in new_problems:
-                        try:
-                            metadata = json.loads(problem.get("metadata", "{}"))
-                            difficulty = metadata.get("difficulty", "Unknown")
-                            problem_type = metadata.get("type", "Unknown")
-                            difficulty_counts[difficulty] = difficulty_counts.get(difficulty, 0) + 1
-                            problem_types[problem_type] = problem_types.get(problem_type, 0) + 1
-                        except:
-                            pass
-                    
-                    for difficulty, count in difficulty_counts.items():
-                        metrics[f"dynamic_generation/difficulty/{difficulty}"] = count
-                    for ptype, count in problem_types.items():
-                        metrics[f"dynamic_generation/type/{ptype}"] = count
-                    
-                    # Log metrics
-                    if hasattr(self, 'logger'):
-                        self.logger.log(metrics, step=self.global_steps)
-                    else:
-                        print(f"Dynamic generation metrics: {metrics}")
-                else:
-                    print("Failed to create new dataloader, keeping current one")
-            else:
-                print("No new problems generated, keeping current dataloader")
-                
-        except Exception as e:
-            print(f"Error in dynamic generation: {e}")
-            print("Continuing with current dataloader")
-
-    def _validate_generated_problems(self, problems: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Validate generated problems and filter out invalid ones."""
-        valid_problems = []
-        
-        for problem in problems:
-            try:
-                # Check required fields
-                required_fields = ["question", "ground_truth", "data_source", "uid"]
-                if not all(field in problem for field in required_fields):
-                    print(f"Skipping problem missing required fields: {problem.get('uid', 'unknown')}")
-                    continue
-                
-                # Validate ground_truth is valid JSON
-                try:
-                    tests = json.loads(problem["ground_truth"])
-                    if not isinstance(tests, list) or len(tests) == 0:
-                        print(f"Skipping problem with invalid tests: {problem['uid']}")
-                        continue
-                except json.JSONDecodeError as e:
-                    print(f"Skipping problem with invalid JSON in ground_truth: {problem['uid']}, error: {e}")
-                    continue
-                
-                # Check that tests have required fields
-                for test in tests:
-                    if not all(field in test for field in ["input", "output", "testtype"]):
-                        print(f"Skipping problem with invalid test format: {problem['uid']}")
-                        break
-                else:
-                    valid_problems.append(problem)
-                    
-            except Exception as e:
-                print(f"Error validating problem {problem.get('uid', 'unknown')}: {e}")
-                continue
-        
-        print(f"Validated {len(valid_problems)}/{len(problems)} problems")
-        return valid_problems
-
-    def _fallback_to_original_dataloader(self):
-        """Fallback to original dataloader if dynamic generation fails."""
-        try:
-            print("Attempting to fallback to original dataloader...")
-            # This would need to be implemented based on how the original dataloader is stored
-            # For now, we'll just disable dynamic generation
-            self.dynamic_generation_active = False
-            print("Disabled dynamic generation due to errors")
-        except Exception as e:
-            print(f"Error in fallback: {e}")
-
-    def _should_generate_new_problems(self) -> bool:
-        """Check if we should generate new problems based on various conditions."""
-        if not self.use_dynamic_generation or not self.dynamic_generation_active:
-            return False
-        
-        # Check frequency
-        if self.global_steps - self.last_generation_step < self.dynamic_generation_frequency:
-            return False
-        
-        # Check if we have enough problems in current dataloader
-        try:
-            current_size = len(self.train_dataloader.dataset) if hasattr(self.train_dataloader, 'dataset') else 0
-            if current_size < self.problems_per_generation:
-                return True
-        except:
-            pass
-        
-        return True
-
-    def _save_generated_problems(self, problems: List[Dict[str, Any]], step: int):
-        """Save generated problems to file for analysis."""
-        try:
-            save_dir = os.path.join(self.config.trainer.default_local_dir, "generated_problems")
-            os.makedirs(save_dir, exist_ok=True)
-            
-            # Use timestamp to avoid race conditions
-            import time
-            timestamp = int(time.time() * 1000)  # milliseconds
-            filename = os.path.join(save_dir, f"problems_step_{step}_{timestamp}.json")
-            
-            with open(filename, 'w') as f:
-                json.dump(problems, f, indent=2)
-            
-            print(f"Saved {len(problems)} generated problems to {filename}")
-        except Exception as e:
-            print(f"Error saving generated problems: {e}")
-
-    def _log_generation_stats(self, problems: List[Dict[str, Any]]):
-        """Log detailed statistics about generated problems."""
-        if not problems:
-            return
-        
-        stats = {
-            "total_problems": len(problems),
-            "avg_tests_per_problem": 0,
-            "difficulty_distribution": {},
-            "type_distribution": {},
-            "avg_question_length": 0
-        }
-        
-        total_tests = 0
-        total_question_length = 0
-        
-        for problem in problems:
-            # Count tests
-            try:
-                tests = json.loads(problem.get("ground_truth", "[]"))
-                total_tests += len(tests)
-            except:
-                pass
-            
-            # Question length
-            total_question_length += len(problem.get("question", ""))
-            
-            # Difficulty and type
-            try:
-                metadata = json.loads(problem.get("metadata", "{}"))
-                difficulty = metadata.get("difficulty", "Unknown")
-                problem_type = metadata.get("type", "Unknown")
-                
-                stats["difficulty_distribution"][difficulty] = stats["difficulty_distribution"].get(difficulty, 0) + 1
-                stats["type_distribution"][problem_type] = stats["type_distribution"].get(problem_type, 0) + 1
-            except:
-                pass
-        
-        if problems:
-            stats["avg_tests_per_problem"] = total_tests / len(problems)
-            stats["avg_question_length"] = total_question_length / len(problems)
-        
-        print(f"Generation stats: {stats}")
-        return stats
-
-    def _handle_api_rate_limit(self, retry_count: int = 0, max_retries: int = 3) -> bool:
-        """Handle API rate limiting with exponential backoff."""
-        if retry_count >= max_retries:
-            print(f"Max retries ({max_retries}) exceeded for API rate limiting")
-            return False
-        
-        import time
-        wait_time = (2 ** retry_count) * 5  # Exponential backoff: 5s, 10s, 20s
-        print(f"Rate limited. Waiting {wait_time} seconds before retry {retry_count + 1}/{max_retries}")
-        time.sleep(wait_time)
-        return True
-
-    def _validate_openai_api_key(self):
-        """Validate OpenAI API key with a simple test call."""
-        try:
-            # Make a minimal test call to validate the API key
-            response = self.openai_client.chat.completions.create(
-                model="gpt-4o",
-                messages=[{"role": "user", "content": "Test"}],
-                max_completion_tokens=1
-            )
-            print("OpenAI API key validated successfully")
-        except Exception as e:
-            raise Exception(f"OpenAI API key validation failed: {e}")

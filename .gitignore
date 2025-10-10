@@ -197,4 +197,5 @@ rllm/data/test/code/livecodebench.json
 rllm/data/train/code/livecodebench.json
 rllm/data/train/code/kodcode.json
 rllm/data/train/code/primeintellect.json
-rllm/data/train/code/primeintellect_dedupe.json
+rllm/data/train/code/primeintellect_dedupe.jsonrllm/data/datasets/
+rllm/registry/
