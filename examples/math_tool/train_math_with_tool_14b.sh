@@ -9,13 +9,16 @@ export VLLM_ENGINE_ITERATION_TIMEOUT_S=100000000000
 # Find the directory where rllm package is located
 RLLM_DIR=$(python3 -c "import rllm; import os; print(os.path.dirname(os.path.dirname(rllm.__file__)))")
 
+# Math tool base model - 14B parameter DeepSeek-R1 distilled model
+MODEL_PATH=deepseek-ai/DeepSeek-R1-Distill-Qwen-14B
+
 python3 -m examples.math_tool.train_math_with_tool \
     algorithm.adv_estimator=grpo \
     data.train_batch_size=32 \
     data.val_batch_size=200 \
     data.max_prompt_length=2048 \
     data.max_response_length=8192 \
-    actor_rollout_ref.model.path=Qwen/Qwen3-14B \
+    actor_rollout_ref.model.path=$MODEL_PATH \
     actor_rollout_ref.model.trust_remote_code=True \
     actor_rollout_ref.hybrid_engine=True \
     actor_rollout_ref.actor.optim.lr=1e-6 \
@@ -41,7 +44,7 @@ python3 -m examples.math_tool.train_math_with_tool \
     actor_rollout_ref.rollout.chat_scheduler=verl.schedulers.completions_scheduler.CompletionsScheduler \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.temperature=0.6 \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
     actor_rollout_ref.rollout.n=8 \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.6 \
